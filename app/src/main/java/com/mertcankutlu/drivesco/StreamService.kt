@@ -17,6 +17,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import androidx.core.app.NotificationCompat
 
 class StreamService : Service() {
@@ -104,8 +105,11 @@ class StreamService : Service() {
         val minRecord = AudioRecord.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_IN_MONO, encoding
         )
-        if (minRecord <= 0) error("AudioRecord buffer alınamadı")
-        val bufferSize = maxOf(minRecord * 2, 4096)
+        val minTrack = AudioTrack.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_OUT_MONO, encoding
+        )
+        if (minRecord <= 0 || minTrack <= 0) error("Ses tamponu alınamadı")
+        val bufferSize = maxOf(minRecord * 2, minTrack * 2, 4096)
 
         val captureConfig = AudioPlaybackCaptureConfiguration.Builder(p)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -136,14 +140,26 @@ class StreamService : Service() {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        if (Build.VERSION.SDK_INT >= 23 && outputDevice != null) {
+            track?.setPreferredDevice(outputDevice)
+        }
+
         running = true
         record!!.startRecording()
         track!!.play()
         worker = Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             val pcm = ShortArray(bufferSize / 2)
-            while (running) {
+            while (running && !Thread.currentThread().isInterrupted) {
                 val n = record?.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING) ?: -1
-                if (n > 0) track?.write(pcm, 0, n, AudioTrack.WRITE_BLOCKING)
+                if (n > 0) {
+                    var offset = 0
+                    while (offset < n && running && !Thread.currentThread().isInterrupted) {
+                        val written = track?.write(pcm, offset, n - offset, AudioTrack.WRITE_BLOCKING) ?: -1
+                        if (written <= 0) break
+                        offset += written
+                    }
+                }
             }
         }.also { it.name = "DriveSCO-AudioBridge"; it.start() }
     }
@@ -159,6 +175,7 @@ class StreamService : Service() {
 
     private fun stopStreaming() {
         running = false
+        worker?.interrupt()
         try { worker?.join(500) } catch (_: InterruptedException) {}
         worker = null
         try { record?.stop() } catch (_: Exception) {}
