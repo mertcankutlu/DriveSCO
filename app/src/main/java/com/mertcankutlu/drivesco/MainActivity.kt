@@ -95,7 +95,7 @@ class MainActivity : ComponentActivity() {
     private fun chooseDevice() {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
         if (android.os.Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.RECORD_AUDIO))
+            permissionLauncher.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT))
             return
         }
         val devices = adapter.bondedDevices.toList().sortedBy { it.name ?: it.address }
