@@ -70,7 +70,8 @@ class StreamService : Service() {
                 ?: error("MediaProjection alınamadı")
             projection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
-                    stopStreaming()
+                    running = false
+                    stopSelf()
                 }
             }, null)
             routeToBluetoothSco(intent.getStringExtra(EXTRA_DEVICE_ADDRESS))
