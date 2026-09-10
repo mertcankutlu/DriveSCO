@@ -54,7 +54,7 @@ class StreamService : Service() {
         if (running) return
         startForeground(
             NOTIFICATION_ID,
-            notification("HFP/SCO aktarımı hazırlanıyor…"),
+            notification("HFP/SCO müzik aktarımı hazırlanıyor…"),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         )
 
@@ -68,6 +68,11 @@ class StreamService : Service() {
             val projectionManager = getSystemService(MediaProjectionManager::class.java)
             projection = projectionManager.getMediaProjection(android.app.Activity.RESULT_OK, data)
                 ?: error("MediaProjection alınamadı")
+            projection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    stopStreaming()
+                }
+            }, null)
             routeToBluetoothSco(intent.getStringExtra(EXTRA_DEVICE_ADDRESS))
             startAudioBridge()
         } catch (_: Exception) {
@@ -80,7 +85,7 @@ class StreamService : Service() {
         if (Build.VERSION.SDK_INT >= 31) {
             val device = audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
-                    (address == null || it.address == address)
+                    (address.isNullOrBlank() || it.address == address)
             } ?: audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             }
@@ -92,7 +97,8 @@ class StreamService : Service() {
 
     private fun startAudioBridge() {
         val p = projection ?: error("Projection yok")
-        val sampleRate = 16000
+        val outputDevice = if (Build.VERSION.SDK_INT >= 31) audioManager.communicationDevice else null
+        val sampleRate = chooseSampleRate(outputDevice)
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val minRecord = AudioRecord.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_IN_MONO, encoding
@@ -118,7 +124,7 @@ class StreamService : Service() {
         track = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build())
             .setAudioFormat(AudioFormat.Builder()
                 .setEncoding(encoding)
@@ -141,6 +147,15 @@ class StreamService : Service() {
         }.also { it.name = "DriveSCO-AudioBridge"; it.start() }
     }
 
+    private fun chooseSampleRate(device: AudioDeviceInfo?): Int {
+        val rates = device?.sampleRates?.toSet().orEmpty()
+        return when {
+            16000 in rates -> 16000
+            8000 in rates -> 8000
+            else -> 16000
+        }
+    }
+
     private fun stopStreaming() {
         running = false
         try { worker?.join(500) } catch (_: InterruptedException) {}
@@ -154,9 +169,12 @@ class StreamService : Service() {
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
         if (::audioManager.isInitialized) {
-            if (Build.VERSION.SDK_INT >= 31) try { audioManager.clearCommunicationDevice() } catch (_: Exception) {}
-            @Suppress("DEPRECATION") audioManager.isBluetoothScoOn = false
-            @Suppress("DEPRECATION") audioManager.stopBluetoothSco()
+            if (Build.VERSION.SDK_INT >= 31) {
+                try { audioManager.clearCommunicationDevice() } catch (_: Exception) {}
+            } else {
+                @Suppress("DEPRECATION") audioManager.isBluetoothScoOn = false
+                @Suppress("DEPRECATION") audioManager.stopBluetoothSco()
+            }
             audioManager.mode = AudioManager.MODE_NORMAL
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
