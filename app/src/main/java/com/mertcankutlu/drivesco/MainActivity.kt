@@ -20,8 +20,8 @@ import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.math.PI
@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var diagnostics: TextView
     private var selectedDevice: BluetoothDevice? = null
     private var testTrack: AudioTrack? = null
+    private var testThread: Thread? = null
 
     private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
@@ -98,9 +99,29 @@ class MainActivity : ComponentActivity() {
             setPadding(0, 0, 0, dp(12))
         }
         root.addView(diagnostics)
+
+        root.addView(TextView(this).apply {
+            text = "HFP kalite testi"
+            textSize = 16f
+            setPadding(0, dp(8), 0, dp(4))
+        })
         root.addView(MaterialButton(this).apply {
-            text = "HFP bağlantısını test et"
-            setOnClickListener { runHfpTest() }
+            text = "8 kHz HFP testi"
+            setOnClickListener { runHfpTest(8000) }
+        })
+        root.addView(MaterialButton(this).apply {
+            text = "16 kHz HFP testi"
+            setOnClickListener { runHfpTest(16000) }
+        })
+        root.addView(MaterialButton(this).apply {
+            text = "Otomatik HFP testi"
+            setOnClickListener { runHfpTest(null) }
+        })
+        root.addView(TextView(this).apply {
+            text = "16 kHz testinde 6 kHz ton da gönderilir. 8 kHz HFP'de bu üst frekansın belirgin biçimde zayıflaması beklenir."
+            textSize = 12f
+            alpha = .65f
+            setPadding(0, 0, 0, dp(12))
         })
         root.addView(MaterialButton(this).apply {
             text = "Müziği HFP'ye aktar"
@@ -115,7 +136,7 @@ class MainActivity : ComponentActivity() {
             }
         })
         root.addView(TextView(this).apply {
-            text = "HFP testinde MediaProjection kullanılmaz. Müzik aktarımı ise Android'in başka uygulama sesini yakalama API'sini kullandığı için sistem onayı ister."
+            text = "HFP testlerinde MediaProjection kullanılmaz. Müzik aktarımı ise Android'in başka uygulama sesini yakalama API'sini kullandığı için sistem onayı ister."
             textSize = 13f
             alpha = .65f
             setPadding(0, dp(20), 0, 0)
@@ -154,13 +175,14 @@ class MainActivity : ComponentActivity() {
         lines += if (sco != null) {
             val rates = sco.sampleRates.joinToString().ifBlank { "bilinmiyor" }
             val encodings = sco.encodings.joinToString().ifBlank { "bilinmiyor" }
-            "HFP/SCO: ${sco.productName} — rate: $rates Hz — PCM: $encodings"
+            val channels = sco.channelCounts.joinToString().ifBlank { "bilinmiyor" }
+            "HFP/SCO: ${sco.productName} — rate: $rates Hz — PCM: $encodings — kanal: $channels"
         } else "HFP/SCO: Android iletişim cihazları arasında görünmüyor"
         lines += "Aktif iletişim: ${current?.productName ?: "yok"}"
         diagnostics.text = lines.joinToString("\n")
     }
 
-    private fun runHfpTest() {
+    private fun runHfpTest(requestedRate: Int?) {
         if (selectedDevice == null) {
             chooseDevice()
             return
@@ -169,12 +191,18 @@ class MainActivity : ComponentActivity() {
             connectPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
             return
         }
+
         stopHfpTest()
         val manager = getSystemService(AudioManager::class.java)
         manager.mode = AudioManager.MODE_IN_COMMUNICATION
         var routeOk = false
         if (Build.VERSION.SDK_INT >= 31) {
-            val sco = manager.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            val sco = manager.availableCommunicationDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
+                    (selectedDevice?.address.isNullOrBlank() || it.address == selectedDevice?.address)
+            } ?: manager.availableCommunicationDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            }
             if (sco != null) routeOk = manager.setCommunicationDevice(sco)
         } else {
             @Suppress("DEPRECATION") manager.startBluetoothSco()
@@ -186,18 +214,16 @@ class MainActivity : ComponentActivity() {
             status.text = "HFP testi: Bluetooth SCO iletişim cihazı seçilemedi"
             return
         }
+
         val device = if (Build.VERSION.SDK_INT >= 31) manager.communicationDevice else null
-        val sampleRate = chooseTestRate(device)
-        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val actualRate = requestedRate ?: chooseTestRate(device)
+        val minBuffer = AudioTrack.getMinBufferSize(actualRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuffer <= 0) {
             status.text = "HFP testi: ses tamponu oluşturulamadı"
             return
         }
-        val buffer = ShortArray(maxOf(1024, minBuffer / 2))
-        for (i in buffer.indices) {
-            val t = i.toDouble() / sampleRate
-            buffer[i] = (sin(2.0 * PI * 440.0 * t) * 7000.0).toInt().toShort()
-        }
+
+        val trackBuffer = maxOf(minBuffer * 2, 4096)
         testTrack = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -205,15 +231,62 @@ class MainActivity : ComponentActivity() {
                 .build())
             .setAudioFormat(AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(sampleRate)
+                .setSampleRate(actualRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build())
-            .setBufferSizeInBytes(maxOf(minBuffer, buffer.size * 2))
+            .setBufferSizeInBytes(trackBuffer)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+
         testTrack?.play()
-        testTrack?.write(buffer, 0, buffer.size)
-        status.text = "HFP testi: ${if (device != null) "SCO seçildi" else "SCO başlatıldı"} — ${sampleRate} Hz test sesi gönderildi"
+        val track = testTrack ?: return
+        val pattern = buildQualityTestPattern(actualRate)
+        testThread = Thread {
+            try {
+                var offset = 0
+                while (offset < pattern.size && !Thread.currentThread().isInterrupted) {
+                    val chunk = minOf(4096, pattern.size - offset)
+                    val written = track.write(pattern, offset, chunk, AudioTrack.WRITE_BLOCKING)
+                    if (written <= 0) break
+                    offset += written
+                }
+            } catch (_: Exception) {
+            }
+        }.also {
+            it.name = "DriveSCO-HfpTest"
+            it.start()
+        }
+
+        val routeName = device?.productName ?: "Bluetooth SCO"
+        val modeText = when (requestedRate) {
+            8000 -> "zorunlu 8 kHz"
+            16000 -> "zorunlu 16 kHz"
+            else -> "otomatik"
+        }
+        status.text = "HFP testi: $routeName — $actualRate Hz ($modeText) gönderiliyor"
+    }
+
+    private fun buildQualityTestPattern(sampleRate: Int): ShortArray {
+        val segments = if (sampleRate >= 16000) {
+            listOf(500.0 to 0.7, 3000.0 to 0.7, 6000.0 to 1.0, 0.0 to 0.3)
+        } else {
+            listOf(500.0 to 0.7, 3000.0 to 0.7, 3500.0 to 1.0, 0.0 to 0.3)
+        }
+        val totalSamples = segments.sumOf { (it.second * sampleRate).toInt() }
+        val out = ShortArray(totalSamples)
+        var pos = 0
+        for ((frequency, seconds) in segments) {
+            val count = (seconds * sampleRate).toInt()
+            for (i in 0 until count) {
+                out[pos++] = if (frequency == 0.0) {
+                    0
+                } else {
+                    val t = i.toDouble() / sampleRate
+                    (sin(2.0 * PI * frequency * t) * 9000.0).toInt().toShort()
+                }
+            }
+        }
+        return out
     }
 
     private fun chooseTestRate(device: AudioDeviceInfo?): Int {
@@ -226,6 +299,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopHfpTest() {
+        testThread?.interrupt()
+        try { testThread?.join(300) } catch (_: InterruptedException) {}
+        testThread = null
         try { testTrack?.stop() } catch (_: Exception) {}
         try { testTrack?.release() } catch (_: Exception) {}
         testTrack = null
