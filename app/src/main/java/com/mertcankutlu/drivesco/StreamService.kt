@@ -8,7 +8,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -30,7 +29,6 @@ class StreamService : Service() {
     private var keepAliveTrack: AudioTrack? = null
     private var worker: Thread? = null
     private lateinit var audioManager: AudioManager
-    private var focusRequest: AudioFocusRequest? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -57,27 +55,10 @@ class StreamService : Service() {
 
         try {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            requestAudioFocus()
             routeToBluetoothSco(address)
             startKeepAlive()
-            running = true
         } catch (_: Exception) {
             stopStreaming()
-        }
-    }
-
-    private fun requestAudioFocus() {
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= 26) {
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(attributes)
-                .build()
-            focusRequest = request
-            audioManager.requestAudioFocus(request)
         }
     }
 
@@ -164,12 +145,6 @@ class StreamService : Service() {
                 @Suppress("DEPRECATION") audioManager.isBluetoothScoOn = false
                 @Suppress("DEPRECATION") audioManager.stopBluetoothSco()
             }
-            focusRequest?.let {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    try { audioManager.abandonAudioFocusRequest(it) } catch (_: Exception) {}
-                }
-            }
-            focusRequest = null
             audioManager.mode = AudioManager.MODE_NORMAL
         }
 
