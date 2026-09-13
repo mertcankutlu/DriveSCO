@@ -11,8 +11,8 @@ android {
         applicationId = "com.mertcankutlu.drivesco"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "Beta V1.0.1"
+        versionCode = 3
+        versionName = "Beta V1.0.2"
     }
 
     compileOptions {
