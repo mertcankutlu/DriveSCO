@@ -8,13 +8,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Process
@@ -24,18 +21,16 @@ class StreamService : Service() {
     companion object {
         const val ACTION_START = "com.mertcankutlu.drivesco.START"
         const val ACTION_STOP = "com.mertcankutlu.drivesco.STOP"
-        const val EXTRA_PROJECTION_DATA = "projection_data"
         const val EXTRA_DEVICE_ADDRESS = "device_address"
         private const val CHANNEL_ID = "drivesco_stream"
         private const val NOTIFICATION_ID = 1001
     }
 
     private var running = false
-    private var record: AudioRecord? = null
-    private var track: AudioTrack? = null
-    private var projection: MediaProjection? = null
+    private var keepAliveTrack: AudioTrack? = null
     private var worker: Thread? = null
     private lateinit var audioManager: AudioManager
+    private var focusRequest: AudioFocusRequest? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -45,45 +40,48 @@ class StreamService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startStreaming(intent)
+            ACTION_START -> startStreaming(intent.getStringExtra(EXTRA_DEVICE_ADDRESS))
             ACTION_STOP -> stopStreaming()
         }
         return START_NOT_STICKY
     }
 
-    private fun startStreaming(intent: Intent) {
+    private fun startStreaming(address: String?) {
         if (running) return
+
         startForeground(
             NOTIFICATION_ID,
-            notification("HFP/SCO müzik aktarımı hazırlanıyor…"),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            notification("HFP/SCO bağlantısı aktif"),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         )
 
-        val data = if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
-        } ?: return stopSelf()
-
         try {
-            val projectionManager = getSystemService(MediaProjectionManager::class.java)
-            projection = projectionManager.getMediaProjection(android.app.Activity.RESULT_OK, data)
-                ?: error("MediaProjection alınamadı")
-            projection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    running = false
-                    stopSelf()
-                }
-            }, null)
-            routeToBluetoothSco(intent.getStringExtra(EXTRA_DEVICE_ADDRESS))
-            startAudioBridge()
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            requestAudioFocus()
+            routeToBluetoothSco(address)
+            startKeepAlive()
+            running = true
         } catch (_: Exception) {
             stopStreaming()
         }
     }
 
+    private fun requestAudioFocus() {
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attributes)
+                .build()
+            focusRequest = request
+            audioManager.requestAudioFocus(request)
+        }
+    }
+
     private fun routeToBluetoothSco(address: String?) {
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         if (Build.VERSION.SDK_INT >= 31) {
             val device = audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
@@ -91,85 +89,61 @@ class StreamService : Service() {
             } ?: audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             }
+
             if (device != null && audioManager.setCommunicationDevice(device)) return
         }
+
         @Suppress("DEPRECATION") audioManager.startBluetoothSco()
         @Suppress("DEPRECATION") audioManager.isBluetoothScoOn = true
     }
 
-    private fun startAudioBridge() {
-        val p = projection ?: error("Projection yok")
-        val outputDevice = if (Build.VERSION.SDK_INT >= 31) audioManager.communicationDevice else null
-        val sampleRate = chooseSampleRate(outputDevice)
-        val encoding = AudioFormat.ENCODING_PCM_16BIT
-        val minRecord = AudioRecord.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_IN_MONO, encoding
+    private fun startKeepAlive() {
+        val sampleRate = 8000
+        val minBuffer = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
         )
-        val minTrack = AudioTrack.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_OUT_MONO, encoding
-        )
-        if (minRecord <= 0 || minTrack <= 0) error("Ses tamponu alınamadı")
-        val bufferSize = maxOf(minRecord * 2, minTrack * 2, 4096)
+        if (minBuffer <= 0) return
 
-        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(p)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
 
-        record = AudioRecord.Builder()
-            .setAudioFormat(AudioFormat.Builder()
-                .setEncoding(encoding)
-                .setSampleRate(sampleRate)
-                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                .build())
-            .setBufferSizeInBytes(bufferSize)
-            .setAudioPlaybackCaptureConfig(captureConfig)
-            .build()
-
-        track = AudioTrack.Builder()
-            .setAudioAttributes(AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build())
-            .setAudioFormat(AudioFormat.Builder()
-                .setEncoding(encoding)
-                .setSampleRate(sampleRate)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build())
-            .setBufferSizeInBytes(bufferSize)
+        keepAliveTrack = AudioTrack.Builder()
+            .setAudioAttributes(attributes)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuffer * 2, 2048))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        if (Build.VERSION.SDK_INT >= 23 && outputDevice != null) {
-            track?.setPreferredDevice(outputDevice)
+        if (Build.VERSION.SDK_INT >= 31) {
+            audioManager.communicationDevice?.let { keepAliveTrack?.setPreferredDevice(it) }
         }
 
+        keepAliveTrack?.play()
         running = true
-        record!!.startRecording()
-        track!!.play()
+
         worker = Thread {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-            val pcm = ShortArray(bufferSize / 2)
+            val silence = ShortArray(160)
             while (running && !Thread.currentThread().isInterrupted) {
-                val n = record?.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING) ?: -1
-                if (n > 0) {
-                    var offset = 0
-                    while (offset < n && running && !Thread.currentThread().isInterrupted) {
-                        val written = track?.write(pcm, offset, n - offset, AudioTrack.WRITE_BLOCKING) ?: -1
-                        if (written <= 0) break
-                        offset += written
-                    }
+                try {
+                    keepAliveTrack?.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
+                } catch (_: Exception) {
+                    break
                 }
             }
-        }.also { it.name = "DriveSCO-AudioBridge"; it.start() }
-    }
-
-    private fun chooseSampleRate(device: AudioDeviceInfo?): Int {
-        val rates = device?.sampleRates?.toSet().orEmpty()
-        return when {
-            16000 in rates -> 16000
-            8000 in rates -> 8000
-            else -> 16000
+        }.also {
+            it.name = "DriveSCO-HfpKeepAlive"
+            it.start()
         }
     }
 
@@ -178,14 +152,11 @@ class StreamService : Service() {
         worker?.interrupt()
         try { worker?.join(500) } catch (_: InterruptedException) {}
         worker = null
-        try { record?.stop() } catch (_: Exception) {}
-        try { record?.release() } catch (_: Exception) {}
-        record = null
-        try { track?.stop() } catch (_: Exception) {}
-        try { track?.release() } catch (_: Exception) {}
-        track = null
-        try { projection?.stop() } catch (_: Exception) {}
-        projection = null
+
+        try { keepAliveTrack?.stop() } catch (_: Exception) {}
+        try { keepAliveTrack?.release() } catch (_: Exception) {}
+        keepAliveTrack = null
+
         if (::audioManager.isInitialized) {
             if (Build.VERSION.SDK_INT >= 31) {
                 try { audioManager.clearCommunicationDevice() } catch (_: Exception) {}
@@ -193,8 +164,15 @@ class StreamService : Service() {
                 @Suppress("DEPRECATION") audioManager.isBluetoothScoOn = false
                 @Suppress("DEPRECATION") audioManager.stopBluetoothSco()
             }
+            focusRequest?.let {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    try { audioManager.abandonAudioFocusRequest(it) } catch (_: Exception) {}
+                }
+            }
+            focusRequest = null
             audioManager.mode = AudioManager.MODE_NORMAL
         }
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -215,7 +193,7 @@ class StreamService : Service() {
     private fun notification(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_headset)
-            .setContentTitle("DriveSCO")
+            .setContentTitle("DriveSCO Beta V1.0.2")
             .setContentText(text)
             .setOngoing(true)
             .build()
